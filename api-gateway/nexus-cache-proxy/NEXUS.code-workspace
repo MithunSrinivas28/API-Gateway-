@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../api-gateway"
+		},
+		{
+			"path": "../mock-service"
+		}
+	],
+	"settings": {}
+}
