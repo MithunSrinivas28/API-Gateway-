@@ -6,9 +6,9 @@
 
 ## What Is This?
 
-Nexus is a distributed backend system built from first principles — an API Gateway layered with an Intelligent Cache Proxy, written entirely in Node.js.
+Nexus is a distributed backend system built from first principles — an API Gateway layered with an Intelligent Cache Proxy and an Event-Driven Architecture, written entirely in Node.js.
 
-It covers the full request lifecycle: from a client hitting the gateway, through authentication, rate limiting, and load balancing, across a TCP-based cache proxy that speaks Redis's binary protocol, all the way to the upstream service. Every layer has one job. Every design decision has a reason.
+It covers the full request lifecycle: from a client hitting the gateway, through authentication, rate limiting, and load balancing, across a TCP-based cache proxy that speaks Redis's binary protocol, all the way to the upstream service — and now emitting structured events to a Kafka broker that a separate consumer service acts on in real time. Every layer has one job. Every design decision has a reason.
 
 ---
 
@@ -18,25 +18,28 @@ It covers the full request lifecycle: from a client hitting the gateway, through
 Client
   │
   ▼
-┌──────────────────────────────────────────────────┐
-│              API Gateway  (Port 3000)            │
-│                                                  │
-│  onRequest   → Token Bucket Rate Limiter         │
-│              → JWT Verifier (HS256)              │
-│                                                  │
-│  preHandler  → Header Injection                  │
-│                                                  │
-│  Proxy       → Load Balancer (RR / LC / WRR)    │
-│              → Circuit Breaker (opossum)         │
-│              → Retry Engine (withRetry)          │
-│              → Request Transformer               │
-│              → /api/* → Upstream Pool            │
-│                                                  │
-│  onResponse  → Response Transformer              │
-│              → Telemetry Logger                  │
-│                                                  │
-│  Discovery   → services.json poller (5s)        │
-└──────────────┬──────────────────┬───────────────┘
+┌──────────────────────────────────────────────────────┐
+│               API Gateway  (Port 3000)               │
+│                                                      │
+│  onRequest   → Token Bucket Rate Limiter             │
+│              → JWT Verifier (HS256)                  │
+│              → Kafka: gateway.rate_limit.hit         │
+│                                                      │
+│  preHandler  → Header Injection                      │
+│                                                      │
+│  Proxy       → Load Balancer (RR / LC / WRR)        │
+│              → Circuit Breaker (opossum)             │
+│              → Kafka: gateway.circuit.opened         │
+│              → Retry Engine (withRetry)              │
+│              → Request Transformer                   │
+│              → /api/* → Upstream Pool                │
+│                                                      │
+│  onResponse  → Response Transformer                  │
+│              → Telemetry Logger                      │
+│              → Kafka: gateway.request.completed      │
+│                                                      │
+│  Discovery   → services.json poller (5s)            │
+└──────────────┬──────────────────┬───────────────────┘
                │                  │
                ▼                  ▼
      ┌──────────────┐   ┌──────────────┐
@@ -45,22 +48,40 @@ Client
      │  /health     │   │  /health     │
      └──────────────┘   └──────────────┘
 
-┌──────────────────────────────────────────────────┐
-│           Cache Proxy  (Port 6380)               │
-│                                                  │
-│  TCP Server  → RESP Parser                       │
-│              → Policy Engine (YAML)              │
-│              → Singleflight Guard                │
-│              → Hot Key Detector                  │
-│              → Tag Invalidation (Lua)            │
-│              → RESP Serializer                   │
-└──────────────────────┬───────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│            Cache Proxy  (Port 6380)                  │
+│                                                      │
+│  TCP Server  → RESP Parser                           │
+│              → Policy Engine (YAML)                  │
+│              → Singleflight Guard                    │
+│              → Hot Key Detector                      │
+│              → Tag Invalidation (Lua)                │
+│              → RESP Serializer                       │
+└──────────────────────┬───────────────────────────────┘
                        │
                        ▼
                  Redis  (Port 6379)
+
+┌──────────────────────────────────────────────────────┐
+│           Kafka Broker  (Port 9092)                  │
+│                                                      │
+│  Topics:                                             │
+│    gateway.rate_limit.hit                            │
+│    gateway.circuit.opened                            │
+│    gateway.request.completed                         │
+└──────────────────────┬───────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────┐
+│           Consumer Service  (nexus-consumer)         │
+│                                                      │
+│  rate_limit.hit   → IP hit counter + auto-block      │
+│  circuit.opened   → upstream failure alert           │
+│  request.completed→ latency spike detection          │
+└──────────────────────────────────────────────────────┘
 ```
 
-Each layer has one job and one job only. The gateway enforces policy and routing. The proxy manages cache intelligence. Redis stores data. The mock services represent any upstream you'd put behind this in production.
+Each layer has one job and one job only. The gateway enforces policy and routing. The proxy manages cache intelligence. Redis stores data. Kafka carries events. The consumer acts on them. The mock services represent any upstream you'd put behind this in production.
 
 ---
 
@@ -139,12 +160,12 @@ TCP has no concept of message boundaries. `SET foo bar` might arrive as 3 separa
 
 It handles all 5 RESP types:
 
-| Prefix | Type          | Example                          |
-|--------|---------------|----------------------------------|
-| `+`    | Simple String | `+OK\r\n`                        |
-| `-`    | Error         | `-ERR unknown command\r\n`       |
-| `:`    | Integer       | `:1000\r\n`                      |
-| `$`    | Bulk String   | `$6\r\nfoobar\r\n`               |
+| Prefix | Type          | Example                             |
+|--------|---------------|-------------------------------------|
+| `+`    | Simple String | `+OK\r\n`                           |
+| `-`    | Error         | `-ERR unknown command\r\n`          |
+| `:`    | Integer       | `:1000\r\n`                         |
+| `$`    | Bulk String   | `$6\r\nfoobar\r\n`                  |
 | `*`    | Array         | `*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n` |
 
 Bulk strings are read by byte count, not by scanning for `\r\n`. This makes the parser binary-safe — a value can contain newlines (like a JSON blob) and the parser handles it correctly.
@@ -283,7 +304,7 @@ x-admin-override:  [stripped]
 **Response** — wraps JSON payloads with gateway metadata:
 ```json
 {
-  "data": { ...upstream response... },
+  "data": { "...upstream response..." },
   "_meta": {
     "requestId": "nexus-1777322108070-hqu2e",
     "gateway": "nexus",
@@ -311,8 +332,6 @@ No restart. No downtime. Edit the file and the gateway converges within 5 second
   ]
 }
 ```
-
-The poller is cleaned up on graceful shutdown via a returned `stopDiscovery()` function.
 
 ### Phase 3 Request Lifecycle
 
@@ -353,13 +372,100 @@ Incoming Request
 
 ---
 
+## Phase 4 — Event-Driven Architecture
+
+Phase 4 decouples observability and automation from the gateway's hot path. Instead of reacting to failures inline — which adds latency and couples concerns — the gateway emits structured events to Kafka. A completely separate consumer service reads those events and acts on them independently.
+
+The gateway fires and forgets. The consumer catches and reacts. Neither knows the other exists beyond the event contract.
+
+### Why Kafka?
+
+Kafka is a distributed commit log, not a message queue. Events are appended to ordered, immutable partitions and retained for a configurable window. This means:
+
+- The consumer can crash and restart without losing events — it resumes from its last committed offset
+- Multiple consumers can independently read the same events for different purposes
+- Events can be replayed for auditing, debugging, or bootstrapping new services
+
+A traditional queue deletes messages on consumption. Kafka keeps them. That's the difference between a fire-and-forget pipe and a durable event history.
+
+### Event Topics
+
+Three topics are emitted from the gateway:
+
+| Topic                          | Fired When                        | Key Fields                                  |
+|--------------------------------|-----------------------------------|---------------------------------------------|
+| `gateway.rate_limit.hit`       | An IP exceeds its token bucket    | `ip`, `method`, `url`                       |
+| `gateway.circuit.opened`       | A circuit breaker trips open      | `upstream`, `method`, `url`                 |
+| `gateway.request.completed`    | Any proxied request finishes      | `method`, `url`, `statusCode`, `latencyMs`, `clientId` |
+
+Every event also carries `emittedAt` — an ISO timestamp added by the producer before sending.
+
+### Partition Key Strategy
+
+Each message is keyed by `correlationId` when present, otherwise round-robined. Keying by correlation ID ensures all events for a single request land on the same partition, which guarantees ordered consumption per request. Out-of-order reads are eliminated without any coordination in the consumer.
+
+### Producer Design
+
+The producer is a single long-lived instance shared across all gateway hooks. KafkaJS producers hold an open TCP connection to the broker — creating one per request would exhaust broker connections immediately.
+
+`emitEvent` is designed to never throw. If the producer is disconnected, the event is dropped with a warning. If the broker is slow, the send is fire-and-forget. Observability must never degrade the gateway's primary function.
+
+```
+onRequest  → isAllowed fails  → emitEvent('gateway.rate_limit.hit', { ip, method, url })
+handler    → breaker trips    → emitEvent('gateway.circuit.opened', { upstream, method, url })
+onResponse → request done     → emitEvent('gateway.request.completed', { statusCode, latencyMs, clientId, ... })
+```
+
+### Consumer Service
+
+The consumer runs as a completely separate Node.js process in `nexus-consumer/`. It joins a consumer group (`nexus-consumer-group`), subscribes to all three topics, and routes each message to a handler by topic name.
+
+**Rate limit handler** — tracks per-IP violation counts in memory. After 5 hits from the same IP, it auto-blocks and logs an action alert. In a production system, this would write the blocked IP to Redis so the gateway reads it on the next request.
+
+**Circuit breaker handler** — logs a structured alert when any upstream trips open. In production, this is where a PagerDuty or Slack webhook fires.
+
+**Request completed handler** — maintains a rolling window of the last 50 request latencies. When a new request's latency exceeds 3× the rolling average, it flags a latency spike with full context. This catches slow upstreams before they become failed upstreams.
+
+```
+[rate-limit] 127.0.0.1 hit rate limit (total: 1) — GET /api/hello
+[rate-limit] 127.0.0.1 hit rate limit (total: 5) — GET /api/hello
+[ACTION] AUTO-BLOCKED IP: 127.0.0.1 after 5 rate limit violations
+
+[request] GET /api/hello → 200 in 4.23ms | client: gateway-client
+[ACTION] LATENCY SPIKE — GET /api/products took 312ms (avg: 5.10ms) | client: gateway-client
+
+[ACTION] ALERT — Circuit opened for upstream: http://127.0.0.1:3002
+```
+
+### Phase 4 Event Flow
+
+```
+API Gateway (port 3000)
+      │
+      │  fire-and-forget
+      ▼
+Kafka Broker (port 9092)
+      │
+      │  offset-tracked consumption
+      ▼
+Consumer Service (nexus-consumer)
+      │
+      ├─ gateway.rate_limit.hit   → count hits per IP → block at threshold
+      ├─ gateway.circuit.opened   → alert on upstream failure
+      └─ gateway.request.completed→ rolling latency baseline → spike detection
+```
+
+---
+
 ## File Structure
 
 ```
 nexus/
 │
 ├── api-gateway/
-│   ├── server.js           ← hooks, routes, proxy, graceful shutdown
+│   ├── server.js           ← hooks, routes, proxy, Kafka emit points, graceful shutdown
+│   ├── kafka/
+│   │   └── producer.js     ← single shared KafkaJS producer, connectProducer, emitEvent
 │   ├── load-balancer.js    ← round-robin, least-conn, weighted RR
 │   ├── circuit-breaker.js  ← opossum wrapper, per-upstream state machine
 │   ├── retry.js            ← withRetry — configurable attempts + delay
@@ -374,19 +480,22 @@ nexus/
 │   ├── server.js           ← upstream mock 1: /products, /health (3001)
 │   └── mock2.js            ← upstream mock 2: /products, /health (3002)
 │
-└── nexus-cache-proxy/
-    ├── index.js            ← entry point, boots TCP server + Redis client
-    ├── server.js           ← TCP server, connection lifecycle, dispatch
-    ├── redis-client.js     ← single shared ioredis instance
-    ├── policy.js           ← loads and queries YAML policy
-    ├── policy.yaml         ← cache rules per command
-    ├── singleflight.js     ← in-flight request deduplication
-    ├── invalidation.js     ← tag-based cache invalidation
-    ├── invalidate.lua      ← atomic Lua deletion script
-    ├── hotkey.js           ← hit tracking + TTL extension
-    └── resp/
-        ├── parser.js       ← stateful streaming RESP decoder
-        └── serializer.js   ← RESP encoder
+├── nexus-cache-proxy/
+│   ├── index.js            ← entry point, boots TCP server + Redis client
+│   ├── server.js           ← TCP server, connection lifecycle, dispatch
+│   ├── redis-client.js     ← single shared ioredis instance
+│   ├── policy.js           ← loads and queries YAML policy
+│   ├── policy.yaml         ← cache rules per command
+│   ├── singleflight.js     ← in-flight request deduplication
+│   ├── invalidation.js     ← tag-based cache invalidation
+│   ├── invalidate.lua      ← atomic Lua deletion script
+│   ├── hotkey.js           ← hit tracking + TTL extension
+│   └── resp/
+│       ├── parser.js       ← stateful streaming RESP decoder
+│       └── serializer.js   ← RESP encoder
+│
+└── nexus-consumer/
+    └── consumer.js         ← KafkaJS consumer, topic router, IP blocker, spike detector
 ```
 
 ---
@@ -395,10 +504,23 @@ nexus/
 
 **Prerequisites:** Node.js v18+, Docker
 
-### 1. Start Redis
+### 1. Start Infrastructure
 
 ```bash
+# Zookeeper (Kafka dependency)
+docker run -d --name zookeeper -p 2181:2181 -e ZOOKEEPER_CLIENT_PORT=2181 confluentinc/cp-zookeeper:7.5.0
+
+# Kafka broker
+docker run -d --name kafka -p 9092:9092 -e KAFKA_BROKER_ID=1 -e KAFKA_ZOOKEEPER_CONNECT=host.docker.internal:2181 -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 confluentinc/cp-kafka:7.5.0
+
+# Redis
 docker run -d -p 6379:6379 redis
+```
+
+After a reboot, start existing containers with:
+```bash
+docker start zookeeper
+docker start kafka
 ```
 
 ### 2. Run Mock Services
@@ -424,6 +546,14 @@ node server.js        # port 3000
 cd nexus-cache-proxy
 npm install
 node index.js         # port 6380
+```
+
+### 5. Run Consumer Service
+
+```bash
+cd nexus-consumer
+npm install
+node consumer.js      # listens to all Kafka topics
 ```
 
 ---
@@ -477,13 +607,15 @@ curl http://localhost:3000/telemetry \
 
 ## Port Map
 
-| Service      | Port |
-|--------------|------|
-| API Gateway  | 3000 |
-| Mock 1       | 3001 |
-| Mock 2       | 3002 |
-| Cache Proxy  | 6380 |
-| Redis        | 6379 |
+| Service          | Port |
+|------------------|------|
+| API Gateway      | 3000 |
+| Mock 1           | 3001 |
+| Mock 2           | 3002 |
+| Cache Proxy      | 6380 |
+| Redis            | 6379 |
+| Kafka Broker     | 9092 |
+| Zookeeper        | 2181 |
 
 ---
 
@@ -499,7 +631,7 @@ Fixed windows punish users for timing. A burst at 11:59:59 and another at 12:00:
 The gateway is the public entry point — it binds to all interfaces. Mock services should never be directly reachable from outside. Binding to loopback enforces that at the network level, not just in code.
 
 **Why replace `@fastify/http-proxy` with a manual proxy?**
-`@fastify/http-proxy` hardcodes a single upstream at registration time. Load balancing requires selecting the upstream *per request*, at runtime. Once you need that control, you own the proxy logic.
+`@fastify/http-proxy` hardcodes a single upstream at registration time. Load balancing requires selecting the upstream per request, at runtime. Once you need that control, you own the proxy logic.
 
 **Why one circuit breaker per upstream URL?**
 A single breaker across all upstreams would trip because of failures on one server, cutting off healthy ones. Isolating breakers means a failing 3002 only affects traffic routed to 3002. 3001 keeps running uninterrupted.
@@ -511,7 +643,7 @@ Retrying the same server that just failed makes no sense. Calling `lb.pick()` fr
 A file can be edited while the process is running. A hardcoded config cannot. The 5-second polling interval is a deliberate tradeoff — fast enough to react to changes, slow enough to not waste I/O on every request.
 
 **Why a custom RESP parser instead of using ioredis on both sides?**
-ioredis abstracts RESP into JS promises — `client.get('key')`. A proxy needs to be protocol-transparent. It must parse raw bytes to understand *what command was issued* before deciding whether to serve from cache or forward to Redis. You have to own the parse/serialize cycle.
+ioredis abstracts RESP into JS promises — `client.get('key')`. A proxy needs to be protocol-transparent. It must parse raw bytes to understand what command was issued before deciding whether to serve from cache or forward to Redis. You have to own the parse/serialize cycle.
 
 **Why Lua for cache invalidation?**
 Redis executes Lua scripts atomically. No command can interleave between reads and deletes inside the script. Without atomicity, concurrent invalidation requests could partially delete a tag — leaving stale keys in cache with no way to track them.
@@ -519,33 +651,42 @@ Redis executes Lua scripts atomically. No command can interleave between reads a
 **Why singleflight?**
 A cache miss under load without singleflight means every concurrent request fires its own Redis call. With singleflight, the first request fires, and everyone else awaits the same promise. One network round-trip per key no matter how many concurrent requests arrive simultaneously.
 
+**Why Kafka over a simple event emitter or HTTP webhook?**
+An event emitter is in-process — if the gateway crashes, all unsent events are gone. An HTTP webhook is synchronous — it adds latency and couples the gateway to the consumer's availability. Kafka gives durability (events survive crashes), decoupling (consumer can be offline and catch up), and replay (re-consume from any offset for debugging or bootstrapping new services).
+
+**Why a separate consumer process instead of handling events inside the gateway?**
+The consumer does things the gateway shouldn't — maintain IP block state, compute rolling averages, trigger alerts. Mixing those concerns into the gateway makes it harder to reason about, test, and scale. A separate process can be redeployed, restarted, or scaled without touching the gateway.
+
+**Why fire-and-forget for `emitEvent`?**
+The gateway's job is to proxy requests. Kafka emission is observability infrastructure. If the broker is slow or down, waiting for acknowledgment would degrade every request. Dropping an event is far less harmful than adding 50ms to a user-facing request.
+
 ---
 
 ## What's Next
 
-- **Phase 4** — Kafka event streaming via `kafkajs`: emit structured events from the gateway (request completed, circuit opened, rate limit hit) and cache proxy, build a separate consumer service that reacts to them — automating IP blocking, alerts, and audit logging
-- **Phase 5** — Full observability: OpenTelemetry distributed tracing, Prometheus metrics, Grafana dashboards, structured log correlation across gateway and proxy
+- **Phase 5** — Full observability: OpenTelemetry distributed tracing, Prometheus metrics, Grafana dashboards, structured log correlation across gateway, cache proxy, and consumer
 - **Phase 6** — Docker Compose full local stack, GitHub Actions CI/CD pipeline, AWS deployment via ECS + S3 + Lambda
 
 ---
 
 ## Tech Stack
 
-| Layer              | Technology                          |
-|--------------------|-------------------------------------|
-| Runtime            | Node.js                             |
-| Gateway Framework  | Fastify                             |
-| Auth               | @fastify/jwt (HS256)                |
-| Rate Limiting      | Custom token bucket (in-memory Map) |
-| Load Balancing     | Custom (RR / Least-Conn / WRR)      |
-| Circuit Breaker    | opossum                             |
-| Proxy Transport    | Node.js `http` module               |
-| Cache Proxy        | Custom TCP server (`net` module)    |
-| Cache Protocol     | RESP — hand-rolled parser + serializer |
-| Redis Client       | ioredis                             |
-| Policy Config      | js-yaml                             |
-| Atomic Invalidation| Redis Lua scripting                 |
-| Infrastructure     | Docker                              |
+| Layer               | Technology                           |
+|---------------------|--------------------------------------|
+| Runtime             | Node.js                              |
+| Gateway Framework   | Fastify                              |
+| Auth                | @fastify/jwt (HS256)                 |
+| Rate Limiting       | Custom token bucket (in-memory Map)  |
+| Load Balancing      | Custom (RR / Least-Conn / WRR)       |
+| Circuit Breaker     | opossum                              |
+| Proxy Transport     | Node.js `http` module                |
+| Cache Proxy         | Custom TCP server (`net` module)     |
+| Cache Protocol      | RESP — hand-rolled parser + serializer |
+| Redis Client        | ioredis                              |
+| Policy Config       | js-yaml                              |
+| Atomic Invalidation | Redis Lua scripting                  |
+| Event Streaming     | Kafka (KafkaJS)                      |
+| Infrastructure      | Docker                               |
 
 ---
 
