@@ -1,8 +1,0 @@
-# cache-proxy/policy.yaml
-policies:
-  - match: GET
-    ttl: 60
-    enabled: true
-  - match: SET
-    ttl: 0
-    enabled: false

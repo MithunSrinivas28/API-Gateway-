@@ -1,5 +1,5 @@
 {
-  "name": "nexus-cache-proxy",
+  "name": "nexus-consumer",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -10,7 +10,6 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "ioredis": "^5.10.1",
-    "js-yaml": "^4.1.1"
+    "kafkajs": "^2.2.4"
   }
 }

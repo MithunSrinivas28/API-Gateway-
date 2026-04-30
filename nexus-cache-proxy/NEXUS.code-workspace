@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../mock-service"
+		},
+		{
+			"path": "../nexus-consumer"
 		}
 	],
 	"settings": {}

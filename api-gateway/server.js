@@ -9,7 +9,8 @@ const fjwt = require('@fastify/jwt');
 const { isAllowed } = require('./rateLimiter');
 const { validateClient } = require('./auth');
 const telemetry = require('./telemetry');
-
+const { emitEvent } = require('./kafka/producer');
+const { connectProducer, disconnectProducer } = require('./kafka/producer');
 const lb = new LoadBalancer(
   [
     { url: 'http://127.0.0.1:3001', weight: 2 },
@@ -26,6 +27,11 @@ fastify.addHook('onRequest', async (request, reply) => {
   const ip = request.ip;
 
   if (!isAllowed(ip)) {
+    emitEvent('gateway.rate_limit.hit', {
+      ip,
+      method: request.method,
+      url: request.url,
+    });
     return reply.code(429).send({
       error: 'Too Many Requests',
       message: 'Rate limit exceeded. Try again shortly.'
@@ -53,15 +59,29 @@ fastify.addHook('preHandler', async (request, reply) => {
 
 fastify.addHook('onResponse', async (request, reply) => {
   const decoded = request.user || null;
+  const clientId = decoded ? decoded.client_id : 'anonymous';
+  const latencyMs = reply.elapsedTime.toFixed(2);
 
   telemetry.record({
     method: request.method,
     url: request.url,
     statusCode: reply.statusCode,
-    latencyMs: reply.elapsedTime.toFixed(2),
+    latencyMs,
     ip: request.ip,
-    clientId: decoded ? decoded.client_id : 'anonymous'
+    clientId,
   });
+
+  // Only emit for proxied API routes, skip internal paths
+  if (request.url.startsWith('/api/')) {
+    emitEvent('gateway.request.completed', {
+      method: request.method,
+      url: request.url,
+      statusCode: reply.statusCode,
+      latencyMs,
+      ip: request.ip,
+      clientId,
+    });
+  }
 });
 
 fastify.post('/auth/token', async (request, reply) => {
@@ -154,9 +174,14 @@ fastify.all('/api/*', async (request, reply) => {
 
       const breaker = getBreaker(server.url);
       breaker.fallback(() => {
-  lb.release(server);
-  throw new Error(`Circuit open for ${server.url}`);
-});
+        emitEvent('gateway.circuit.opened', {
+          upstream: server.url,
+          method: request.method,
+          url: request.url,
+        });
+        lb.release(server);
+        throw new Error(`Circuit open for ${server.url}`);
+      });
 
       await breaker.fire(action);
 
@@ -188,11 +213,14 @@ fastify.get('/telemetry', async (request, reply) => {
 });
 
 // Graceful shutdown
+
+
 const stopDiscovery = startDiscovery(lb, fastify.log);
 
 const shutdown = async (signal) => {
   fastify.log.info(`Received ${signal}. Shutting down gracefully...`);
   stopDiscovery();
+  await disconnectProducer();
   await fastify.close();
   fastify.log.info('Server closed. Exiting.');
   process.exit(0);
@@ -201,7 +229,16 @@ const shutdown = async (signal) => {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-fastify.listen({ port: 3000, host: '0.0.0.0' }, (err, address) => {
-  if (err) throw err;
-  console.log(`API Gateway running at ${address}`);
-});
+fastify.listen({ port: 3000, host: '0.0.0.0' })
+  .then(async (address) => {
+    await connectProducer();
+    console.log(`API Gateway running at ${address}`);
+  })
+  .catch((err) => {
+    fastify.log.error(err);
+    process.exit(1);
+  });
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
