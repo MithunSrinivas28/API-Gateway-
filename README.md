@@ -8,7 +8,7 @@
 
 Nexus is a distributed backend system built from first principles — an API Gateway layered with an Intelligent Cache Proxy and an Event-Driven Architecture, written entirely in Node.js.
 
-It covers the full request lifecycle: from a client hitting the gateway, through authentication, rate limiting, and load balancing, across a TCP-based cache proxy that speaks Redis's binary protocol, all the way to the upstream service — and now emitting structured events to a Kafka broker that a separate consumer service acts on in real time. Every layer has one job. Every design decision has a reason.
+It covers the full request lifecycle: from a client hitting the gateway, through authentication, rate limiting, and load balancing, across a TCP-based cache proxy that speaks Redis's binary protocol, all the way to the upstream service — emitting structured events to a Kafka broker that a separate consumer service acts on in real time. Every request now generates a distributed trace, emits metrics, and leaves a correlated log line. Every layer has one job. Every design decision has a reason.
 
 ---
 
@@ -18,28 +18,36 @@ It covers the full request lifecycle: from a client hitting the gateway, through
 Client
   │
   ▼
-┌──────────────────────────────────────────────────────┐
-│               API Gateway  (Port 3000)               │
-│                                                      │
-│  onRequest   → Token Bucket Rate Limiter             │
-│              → JWT Verifier (HS256)                  │
-│              → Kafka: gateway.rate_limit.hit         │
-│                                                      │
-│  preHandler  → Header Injection                      │
-│                                                      │
-│  Proxy       → Load Balancer (RR / LC / WRR)        │
-│              → Circuit Breaker (opossum)             │
-│              → Kafka: gateway.circuit.opened         │
-│              → Retry Engine (withRetry)              │
-│              → Request Transformer                   │
-│              → /api/* → Upstream Pool                │
-│                                                      │
-│  onResponse  → Response Transformer                  │
-│              → Telemetry Logger                      │
-│              → Kafka: gateway.request.completed      │
-│                                                      │
-│  Discovery   → services.json poller (5s)            │
-└──────────────┬──────────────────┬───────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                  API Gateway  (Port 3000)                    │
+│                                                              │
+│  onRequest   → OTel Root Span (SERVER kind)                  │
+│              → Token Bucket Rate Limiter                     │
+│              → JWT Verifier (HS256)                          │
+│              → Kafka: gateway.rate_limit.hit                 │
+│              → Prometheus: rate limit counter                │
+│                                                              │
+│  preHandler  → Header Injection                              │
+│                                                              │
+│  Proxy       → Load Balancer (RR / LC / WRR)                │
+│              → Circuit Breaker (opossum)                     │
+│              → Kafka: gateway.circuit.opened                 │
+│              → OTel Child Span (CLIENT kind) + traceparent   │
+│              → Retry Engine (withRetry)                      │
+│              → Request Transformer                           │
+│              → /api/* → Upstream Pool                        │
+│                                                              │
+│  onResponse  → Response Transformer                          │
+│              → OTel Root Span closed (status + code)        │
+│              → Prometheus: request counter + histogram       │
+│              → Telemetry Logger                              │
+│              → Kafka: gateway.request.completed              │
+│                                                              │
+│  Discovery   → services.json poller (5s)                    │
+│                                                              │
+│  Endpoints   → /metrics  (Prometheus scrape target)         │
+│              → /health   /telemetry  /lb-stats  /cb-stats    │
+└──────────────┬──────────────────┬───────────────────────────┘
                │                  │
                ▼                  ▼
      ┌──────────────┐   ┌──────────────┐
@@ -48,40 +56,48 @@ Client
      │  /health     │   │  /health     │
      └──────────────┘   └──────────────┘
 
-┌──────────────────────────────────────────────────────┐
-│            Cache Proxy  (Port 6380)                  │
-│                                                      │
-│  TCP Server  → RESP Parser                           │
-│              → Policy Engine (YAML)                  │
-│              → Singleflight Guard                    │
-│              → Hot Key Detector                      │
-│              → Tag Invalidation (Lua)                │
-│              → RESP Serializer                       │
-└──────────────────────┬───────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│              Cache Proxy  (Port 6380)                        │
+│                                                              │
+│  TCP Server  → RESP Parser                                   │
+│              → Policy Engine (YAML)                          │
+│              → Singleflight Guard                            │
+│              → Hot Key Detector                              │
+│              → Tag Invalidation (Lua)                        │
+│              → RESP Serializer                               │
+└──────────────────────┬───────────────────────────────────────┘
                        │
                        ▼
                  Redis  (Port 6379)
 
-┌──────────────────────────────────────────────────────┐
-│           Kafka Broker  (Port 9092)                  │
-│                                                      │
-│  Topics:                                             │
-│    gateway.rate_limit.hit                            │
-│    gateway.circuit.opened                            │
-│    gateway.request.completed                         │
-└──────────────────────┬───────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│            Kafka Broker  (Port 9092)                         │
+│                                                              │
+│  Topics:                                                     │
+│    gateway.rate_limit.hit                                    │
+│    gateway.circuit.opened                                    │
+│    gateway.request.completed                                 │
+└──────────────────────┬───────────────────────────────────────┘
                        │
                        ▼
-┌──────────────────────────────────────────────────────┐
-│           Consumer Service  (nexus-consumer)         │
-│                                                      │
-│  rate_limit.hit   → IP hit counter + auto-block      │
-│  circuit.opened   → upstream failure alert           │
-│  request.completed→ latency spike detection          │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│           Consumer Service  (nexus-consumer)                 │
+│                                                              │
+│  rate_limit.hit   → IP hit counter + auto-block              │
+│  circuit.opened   → upstream failure alert                   │
+│  request.completed→ latency spike detection                  │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│              Observability Stack                             │
+│                                                              │
+│  Jaeger   (Port 16686) ← OTel spans via OTLP/HTTP (4318)    │
+│  Prometheus (Port 9090) ← scrapes /metrics every 15s        │
+│  Grafana  (Port 3004)  ← queries Prometheus, dashboards      │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Each layer has one job and one job only. The gateway enforces policy and routing. The proxy manages cache intelligence. Redis stores data. Kafka carries events. The consumer acts on them. The mock services represent any upstream you'd put behind this in production.
+Each layer has one job and one job only. The gateway enforces policy and routing. The proxy manages cache intelligence. Redis stores data. Kafka carries events. The consumer acts on them. The observability stack records everything without touching the hot path.
 
 ---
 
@@ -410,21 +426,15 @@ The producer is a single long-lived instance shared across all gateway hooks. Ka
 
 `emitEvent` is designed to never throw. If the producer is disconnected, the event is dropped with a warning. If the broker is slow, the send is fire-and-forget. Observability must never degrade the gateway's primary function.
 
-```
-onRequest  → isAllowed fails  → emitEvent('gateway.rate_limit.hit', { ip, method, url })
-handler    → breaker trips    → emitEvent('gateway.circuit.opened', { upstream, method, url })
-onResponse → request done     → emitEvent('gateway.request.completed', { statusCode, latencyMs, clientId, ... })
-```
-
 ### Consumer Service
 
 The consumer runs as a completely separate Node.js process in `nexus-consumer/`. It joins a consumer group (`nexus-consumer-group`), subscribes to all three topics, and routes each message to a handler by topic name.
 
-**Rate limit handler** — tracks per-IP violation counts in memory. After 5 hits from the same IP, it auto-blocks and logs an action alert. In a production system, this would write the blocked IP to Redis so the gateway reads it on the next request.
+**Rate limit handler** — tracks per-IP violation counts in memory. After 5 hits from the same IP, it auto-blocks and logs an action alert.
 
-**Circuit breaker handler** — logs a structured alert when any upstream trips open. In production, this is where a PagerDuty or Slack webhook fires.
+**Circuit breaker handler** — logs a structured alert when any upstream trips open.
 
-**Request completed handler** — maintains a rolling window of the last 50 request latencies. When a new request's latency exceeds 3× the rolling average, it flags a latency spike with full context. This catches slow upstreams before they become failed upstreams.
+**Request completed handler** — maintains a rolling window of the last 50 request latencies. When a new request's latency exceeds 3× the rolling average, it flags a latency spike with full context.
 
 ```
 [rate-limit] 127.0.0.1 hit rate limit (total: 1) — GET /api/hello
@@ -457,13 +467,168 @@ Consumer Service (nexus-consumer)
 
 ---
 
+## Phase 5 — Observability
+
+Phase 5 adds the three pillars of observability to the system: distributed tracing, metrics, and structured log correlation. None of this touches the hot path — spans are batched and flushed asynchronously, metrics are scraped on a pull model, and log fields are injected at request start with zero overhead.
+
+The goal is to answer three different questions:
+- **Traces** — where in this specific request did time go?
+- **Metrics** — how is the system behaving across all requests right now?
+- **Logs** — what exactly happened during this specific event?
+
+### Phase 5a — Distributed Tracing (OpenTelemetry + Jaeger)
+
+Every request through the gateway generates a **trace** — a tree of spans where each span represents a unit of work with a start time, end time, and attributes. The OTel SDK is initialized in `tracing.js` before any other module loads, which is why it must be `require()`-d as the absolute first line of `server.js`.
+
+**How it works:**
+
+```
+Incoming Request
+      │
+      ▼
+ onRequest  → extract W3C traceparent from headers (if present)
+            → start ROOT span (SERVER kind)
+              attributes: http.method, http.url, http.route, net.peer.ip
+            → inject trace_id + span_id into Pino logger (child logger)
+      │
+      ▼
+ Proxy      → start CHILD span (CLIENT kind) — upstream.proxy
+            → inject traceparent header into outgoing request
+              format: 00-<traceId>-<spanId>-01
+            → upstream receives traceparent, can start its own child span
+            → record http.status_code on response
+            → end child span
+      │
+      ▼
+ onResponse → set final http.status_code on root span
+            → set span status (OK / ERROR based on status code)
+            → end root span
+            → BatchSpanProcessor flushes to Jaeger every 500ms
+```
+
+**What you see in Jaeger:**
+
+```
+nexus-gateway: GET /api/*                        19.4ms
+  └─ upstream.proxy                              15.2ms
+       peer.service: http://127.0.0.1:3001
+       http.status_code: 404
+```
+
+The W3C `traceparent` header links spans across service boundaries. If the upstream service also instruments with OTel and reads that header, its spans appear as children of the same trace in Jaeger — one waterfall showing the full cross-service request path.
+
+**Span export:** Spans are batched in-process (`maxQueueSize: 2048`, `scheduledDelayMillis: 500ms`, `maxExportBatchSize: 512`) and exported via OTLP/HTTP to Jaeger on port 4318. The batch processor ensures the hot path never blocks on a network flush.
+
+### Phase 5b — Prometheus Metrics
+
+Prometheus works on a pull model — it scrapes your `/metrics` endpoint on a schedule (every 15 seconds) and stores the values as time-series data. The gateway exposes six instruments:
+
+**Counters** (monotonically increasing):
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `nexus_http_requests_total` | method, route, status_code | every request received |
+| `nexus_rate_limit_hits_total` | ip | every request rejected by rate limiter |
+| `nexus_circuit_breaker_opens_total` | upstream | every circuit breaker trip |
+
+**Histograms** (latency distributions):
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `nexus_http_request_duration_ms` | method, route, status_code | full request latency |
+| `nexus_upstream_request_duration_ms` | upstream, method, status_code | upstream call latency only |
+
+**Gauge** (can increase and decrease):
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `nexus_circuit_breaker_state` | upstream | 0=closed, 1=open, 2=half-open |
+
+Histograms use buckets `[1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000]` ms. Buckets let Prometheus compute true percentiles — `histogram_quantile(0.99, ...)` gives the p99 latency over any time window. A plain average can't do that.
+
+The `/metrics` endpoint is unauthenticated and excluded from JWT verification — it's a Prometheus scrape target, not a user-facing route. Default Node.js runtime metrics are also collected under the `nexus_` prefix (event loop lag, heap usage, GC pauses, active handles).
+
+**Grafana dashboards:**
+
+Four panels are configured in the Nexus Gateway dashboard:
+
+```
+┌─────────────────────────────┐ ┌─────────────────────────────┐
+│  Request Rate (req/sec)     │ │  p99 Request Latency (ms)   │
+│  rate(nexus_http_requests   │ │  histogram_quantile(0.99,   │
+│  _total[1m])                │ │  rate(..._bucket[1m]))      │
+└─────────────────────────────┘ └─────────────────────────────┘
+┌─────────────────────────────┐ ┌─────────────────────────────┐
+│  Rate Limit Hits (last 5m)  │ │  p95 Upstream Latency (ms)  │
+│  increase(nexus_rate_limit  │ │  histogram_quantile(0.95,   │
+│  _hits_total[5m])           │ │  rate(..._bucket[1m]))      │
+└─────────────────────────────┘ └─────────────────────────────┘
+```
+
+### Phase 5c — Structured Log Correlation
+
+Every Pino log line for a request carries `trace_id` and `span_id` from the active OTel span. This is wired at the start of `onRequest` using Pino's child logger:
+
+```javascript
+const { traceId, spanId } = span.spanContext();
+req.log = req.log.child({ trace_id: traceId, span_id: spanId });
+```
+
+Every subsequent `req.log.info(...)` call automatically includes those fields:
+
+```json
+{
+  "level": 30,
+  "reqId": "req-2",
+  "trace_id": "c160fc98aa80ca92a9f9238453a4a6a1",
+  "span_id": "afd2b0f4229a2dd1",
+  "url": "/api/hello",
+  "method": "GET",
+  "msg": "request started"
+}
+```
+
+Take any `trace_id` from a log line, paste it into Jaeger's search, and it returns the exact trace for that request. Logs and traces are linked without any external log aggregation system.
+
+### Phase 5 — Full Observability Flow
+
+```
+Request arrives
+      │
+      ▼
+ onRequest  → OTel span started (traceId generated)
+            → trace_id injected into Pino child logger
+            → all logs for this request carry trace_id
+      │
+      ▼
+ Proxy      → traceparent injected into upstream headers
+            → upstream span started (CLIENT kind)
+            → upstream span ended with status + duration
+            → Prometheus upstream histogram updated
+      │
+      ▼
+ onResponse → OTel root span ended
+            → Prometheus request counter incremented
+            → Prometheus request histogram updated
+            → Pino log emitted (with trace_id)
+      │
+      ▼
+ Async      → BatchSpanProcessor flushes spans to Jaeger (500ms)
+            → Prometheus scrapes /metrics (15s interval)
+            → Grafana queries Prometheus (configurable interval)
+```
+
+---
+
 ## File Structure
 
 ```
 nexus/
 │
 ├── api-gateway/
-│   ├── server.js           ← hooks, routes, proxy, Kafka emit points, graceful shutdown
+│   ├── server.js           ← hooks, routes, proxy, OTel spans, Kafka emit, Prometheus record
+│   ├── tracing.js          ← OTel SDK init, BatchSpanProcessor, OTLP export to Jaeger
+│   ├── metrics.js          ← prom-client registry, counters, histograms, gauges
 │   ├── kafka/
 │   │   └── producer.js     ← single shared KafkaJS producer, connectProducer, emitEvent
 │   ├── load-balancer.js    ← round-robin, least-conn, weighted RR
@@ -494,8 +659,10 @@ nexus/
 │       ├── parser.js       ← stateful streaming RESP decoder
 │       └── serializer.js   ← RESP encoder
 │
-└── nexus-consumer/
-    └── consumer.js         ← KafkaJS consumer, topic router, IP blocker, spike detector
+├── nexus-consumer/
+│   └── consumer.js         ← KafkaJS consumer, topic router, IP blocker, spike detector
+│
+└── prometheus.yml          ← Prometheus scrape config (targets: host.docker.internal:3000)
 ```
 
 ---
@@ -508,19 +675,42 @@ nexus/
 
 ```bash
 # Zookeeper (Kafka dependency)
-docker run -d --name zookeeper -p 2181:2181 -e ZOOKEEPER_CLIENT_PORT=2181 confluentinc/cp-zookeeper:7.5.0
+docker run -d --name zookeeper -p 2181:2181 \
+  -e ZOOKEEPER_CLIENT_PORT=2181 \
+  confluentinc/cp-zookeeper:7.5.0
 
 # Kafka broker
-docker run -d --name kafka -p 9092:9092 -e KAFKA_BROKER_ID=1 -e KAFKA_ZOOKEEPER_CONNECT=host.docker.internal:2181 -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 confluentinc/cp-kafka:7.5.0
+docker run -d --name kafka -p 9092:9092 \
+  -e KAFKA_BROKER_ID=1 \
+  -e KAFKA_ZOOKEEPER_CONNECT=host.docker.internal:2181 \
+  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  confluentinc/cp-kafka:7.5.0
 
 # Redis
-docker run -d -p 6379:6379 redis
+docker run -d --name redis -p 6379:6379 redis
+
+# Jaeger (distributed tracing UI)
+docker run -d --name jaeger \
+  -p 16686:16686 \
+  -p 4318:4318 \
+  jaegertracing/all-in-one:1.53
+
+# Prometheus (metrics scraper)
+docker run -d --name prometheus \
+  -p 9090:9090 \
+  -v /path/to/prometheus.yml:/etc/prometheus/prometheus.yml \
+  prom/prometheus:v2.45.0
+
+# Grafana (dashboards)
+docker run -d --name grafana \
+  -p 3004:3000 \
+  grafana/grafana:10.2.0
 ```
 
-After a reboot, start existing containers with:
+After a reboot, start existing containers:
 ```bash
-docker start zookeeper
-docker start kafka
+docker start zookeeper kafka redis jaeger prometheus grafana
 ```
 
 ### 2. Run Mock Services
@@ -603,19 +793,37 @@ curl http://localhost:3000/telemetry \
   -H "Authorization: Bearer <your_token>"
 ```
 
+### View Prometheus Metrics
+
+```bash
+curl http://localhost:3000/metrics
+```
+
+### View Distributed Traces
+
+Open `http://localhost:16686`, select service `nexus-gateway`, click Find Traces.
+
+### View Grafana Dashboards
+
+Open `http://localhost:3004`, navigate to Dashboards → Nexus Gateway.
+
 ---
 
 ## Port Map
 
-| Service          | Port |
-|------------------|------|
-| API Gateway      | 3000 |
-| Mock 1           | 3001 |
-| Mock 2           | 3002 |
-| Cache Proxy      | 6380 |
-| Redis            | 6379 |
-| Kafka Broker     | 9092 |
-| Zookeeper        | 2181 |
+| Service          | Port  |
+|------------------|-------|
+| API Gateway      | 3000  |
+| Mock 1           | 3001  |
+| Mock 2           | 3002  |
+| Grafana          | 3004  |
+| Redis            | 6379  |
+| Cache Proxy      | 6380  |
+| Zookeeper        | 2181  |
+| Kafka Broker     | 9092  |
+| Jaeger UI        | 16686 |
+| Jaeger OTLP/HTTP | 4318  |
+| Prometheus       | 9090  |
 
 ---
 
@@ -660,33 +868,50 @@ The consumer does things the gateway shouldn't — maintain IP block state, comp
 **Why fire-and-forget for `emitEvent`?**
 The gateway's job is to proxy requests. Kafka emission is observability infrastructure. If the broker is slow or down, waiting for acknowledgment would degrade every request. Dropping an event is far less harmful than adding 50ms to a user-facing request.
 
+**Why `tracing.js` must be the first require in `server.js`?**
+The OTel SDK works by monkey-patching Node's `http` module before it's used by anything else. If Fastify or any other module loads `http` first, the instrumentation misses those calls entirely. The require order is a hard constraint, not a convention.
+
+**Why `BatchSpanProcessor` instead of `SimpleSpanProcessor`?**
+`SimpleSpanProcessor` exports spans synchronously — every span end blocks until the export completes. On a busy gateway, this would add the Jaeger network round-trip latency to every single request. `BatchSpanProcessor` queues spans in memory and flushes them in background batches. The hot path never waits on observability infrastructure.
+
+**Why histograms for latency instead of gauges or summaries?**
+A gauge only holds the current value — you lose history between scrapes. A Prometheus summary computes percentiles client-side and can't be aggregated across instances. A histogram stores the full bucket distribution server-side, so Prometheus can compute any percentile (`histogram_quantile`) across any time window and aggregate across multiple gateway instances correctly.
+
+**Why pull-based scraping (Prometheus) instead of push-based metrics?**
+Push-based systems require the application to know where to send metrics. Pull-based systems let the infrastructure decide what to monitor and when. If the gateway crashes, Prometheus notices immediately — the scrape fails. With push-based metrics, a crashed service just goes silent and you might not notice for minutes.
+
+**Why correlate logs with trace IDs instead of using a centralized log aggregator?**
+Centralized log aggregators (ELK, Loki) are the right answer at scale, but they require additional infrastructure. Log-trace correlation via `trace_id` in Pino gives you the link between a specific log event and its full distributed trace in Jaeger without any additional tooling. It's a zero-cost addition that pays off every time you need to debug a specific request.
+
 ---
 
 ## What's Next
 
-- **Phase 5** — Full observability: OpenTelemetry distributed tracing, Prometheus metrics, Grafana dashboards, structured log correlation across gateway, cache proxy, and consumer
-- **Phase 6** — Docker Compose full local stack, GitHub Actions CI/CD pipeline, AWS deployment via ECS + S3 + Lambda
+- **Phase 6** — Docker Compose full local stack (single `docker-compose.yml` for all services), GitHub Actions CI/CD pipeline, AWS deployment via ECS + S3 + Lambda
 
 ---
 
 ## Tech Stack
 
-| Layer               | Technology                           |
-|---------------------|--------------------------------------|
-| Runtime             | Node.js                              |
-| Gateway Framework   | Fastify                              |
-| Auth                | @fastify/jwt (HS256)                 |
-| Rate Limiting       | Custom token bucket (in-memory Map)  |
-| Load Balancing      | Custom (RR / Least-Conn / WRR)       |
-| Circuit Breaker     | opossum                              |
-| Proxy Transport     | Node.js `http` module                |
-| Cache Proxy         | Custom TCP server (`net` module)     |
-| Cache Protocol      | RESP — hand-rolled parser + serializer |
-| Redis Client        | ioredis                              |
-| Policy Config       | js-yaml                              |
-| Atomic Invalidation | Redis Lua scripting                  |
-| Event Streaming     | Kafka (KafkaJS)                      |
-| Infrastructure      | Docker                               |
+| Layer               | Technology                            |
+|---------------------|---------------------------------------|
+| Runtime             | Node.js                               |
+| Gateway Framework   | Fastify                               |
+| Auth                | @fastify/jwt (HS256)                  |
+| Rate Limiting       | Custom token bucket (in-memory Map)   |
+| Load Balancing      | Custom (RR / Least-Conn / WRR)        |
+| Circuit Breaker     | opossum                               |
+| Proxy Transport     | Node.js `http` module                 |
+| Cache Proxy         | Custom TCP server (`net` module)      |
+| Cache Protocol      | RESP — hand-rolled parser + serializer|
+| Redis Client        | ioredis                               |
+| Policy Config       | js-yaml                               |
+| Atomic Invalidation | Redis Lua scripting                   |
+| Event Streaming     | Kafka (KafkaJS)                       |
+| Distributed Tracing | OpenTelemetry SDK + Jaeger            |
+| Metrics             | prom-client + Prometheus + Grafana    |
+| Structured Logging  | Pino (trace_id correlated)            |
+| Infrastructure      | Docker                                |
 
 ---
 
